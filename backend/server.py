@@ -94,6 +94,134 @@ def init_db():
           CREATE INDEX IF NOT EXISTS idx_channels_room ON channels(room_id,position,id);
           CREATE TABLE IF NOT EXISTS custom_roles(
              id INTEGER PRIMARY KEY,
+             room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+             name TEXT NOT NULL,
+             color TEXT NOT NULL DEFAULT '#9b83f7',
+             manage_channels INTEGER NOT NULL DEFAULT 0,
+             manage_messages INTEGER NOT NULL DEFAULT 0,
+             view_private INTEGER NOT NULL DEFAULT 0,
+             created INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS member_custom_roles(
+             room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+             role_id INTEGER NOT NULL REFERENCES custom_roles(id) ON DELETE CASCADE,
+             PRIMARY KEY(room_id,user_id,role_id));
+        ''')
+        if 'archived' not in {r[1] for r in c.execute('PRAGMA table_info(channels)')}:
+            c.execute('ALTER TABLE channels ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
+        for r in c.execute("SELECT id,kind FROM rooms WHERE kind='server'").fetchall():
+            if not c.execute('SELECT 1 FROM channels WHERE room_id=?',(r['id'],)).fetchone():
+                cur=c.execute('INSERT INTO channels(room_id,name,category,position,created) VALUES (?,?,?,?,?)',(r['id'],'ogólny','TEKSTOWE',0,int(time.time())))
+                c.execute('UPDATE messages SET channel_id=? WHERE room_id=? AND channel_id IS NULL',(cur.lastrowid,r['id']))
+                c.execute('INSERT INTO channels(room_id,name,category,kind,position,created) VALUES (?,?,?,?,?,?)',(r['id'],'ogłoszenia','INFORMACJE','announcement',1,int(time.time())))
+            c.execute('INSERT OR IGNORE INTO room_config(room_id) VALUES (?)',(r['id'],))
+init_db()
+
+class Credentials(BaseModel):
+    username:str=Field(min_length=3,max_length=24)
+    password:str=Field(min_length=8,max_length=128)
+    email:Optional[str]=None
+    display_name:Optional[str]=Field(default=None,max_length=32)
+class LoginIn(BaseModel):
+    username:str=Field(min_length=3,max_length=254)
+    password:str=Field(min_length=1,max_length=128)
+class RoomIn(BaseModel):
+    name:str=Field(min_length=2,max_length=70)
+    kind:str='group'
+class DMIn(BaseModel): username:str
+class MsgIn(BaseModel):
+    body:str=Field(min_length=1,max_length=4000)
+    channel_id:Optional[int]=None
+class PollIn(BaseModel):
+    question:str=Field(min_length=3,max_length=200)
+    options:list[str]
+    multiple:bool=False
+    anonymous:bool=False
+    channel_id:Optional[int]=None
+class VoteIn(BaseModel): option_ids:list[int]
+class BotIn(BaseModel):
+    name:str=Field(min_length=2,max_length=32)
+    trigger:str=Field(min_length=2,max_length=30)
+    response:str=Field(min_length=1,max_length=500)
+class ProfileIn(BaseModel):
+    display_name:str=Field(min_length=1,max_length=32)
+    about:str=Field(max_length=220)
+    color:str='#7c5cf0'
+    status_text:str=Field(default='',max_length=80)
+class ReactionIn(BaseModel): emoji:str
+class ChannelIn(BaseModel):
+    name:str=Field(min_length=2,max_length=40)
+    category:str=Field(default='TEKSTOWE',max_length=32)
+    kind:str='text'
+    staff_only:bool=False
+class RoomSettingsIn(BaseModel):
+    name:str=Field(min_length=2,max_length=70)
+    description:str=Field(default='',max_length=500)
+    rules:str=Field(default='',max_length=6000)
+    welcome:str=Field(default='',max_length=300)
+    accent:str='#8b6cf3'
+class CustomRoleIn(BaseModel):
+    name:str=Field(min_length=2,max_length=35)
+    color:str='#9b83f7'
+    manage_channels:bool=False
+    manage_messages:bool=False
+    view_private:bool=False
+class RoleAssignIn(BaseModel):
+    assigned:bool
+class InviteIn(BaseModel): code:str
+class RoleIn(BaseModel): role:str
+
+USERNAME_RE=re.compile(r'^[a-zA-Z0-9_]{3,24}$')
+EMAIL_RE=re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+COLOR_RE=re.compile(r'^#[0-9a-fA-F]{6}$')
+
+def tick(): return int(time.time())
+def pw_hash(p):
+    salt=secrets.token_bytes(16)
+    return 'pbkdf2$'+salt.hex()+'$'+hashlib.pbkdf2_hmac('sha256',p.encode(),salt,310_000).hex()
+def pw_check(p,encoded):
+    try:
+        _,salt,key=encoded.split('$')
+        return hmac.compare_digest(hashlib.pbkdf2_hmac('sha256',p.encode(),bytes.fromhex(salt),310_000),bytes.fromhex(key))
+    except (ValueError,TypeError): return False
+
+def make_session(resp,uid,req):
+    token=secrets.token_urlsafe(40)
+    with transaction() as c:
+        c.execute('INSERT INTO sessions VALUES (?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),uid,tick()+30*86400))
+    secure=req.url.scheme=='https' or os.getenv('VILO_SECURE_COOKIES')=='1'
+    resp.set_cookie('vilo_session',token,max_age=30*86400,httponly=True,secure=secure,samesite='lax',path='/')
+
+def session_user(token):
+    if not token: return None
+    return one('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>?',hashlib.sha256(token.encode()).hexdigest(),tick())
+def current(req:Request):
+    u=session_user(req.cookies.get('vilo_session'))
+    if not u: raise HTTPException(401,'Zaloguj się, aby kontynuować.')
+    return u
+
+def user_public(u):
+    return {k:u[k] for k in ('id','username','display_name','about','color','created','status_text','avatar_rev','banner_rev') if k in u.keys()}
+
+def room_member(room_id, uid):
+    m=one('SELECT m.*,r.kind,r.name,r.owner_id FROM members m JOIN rooms r ON r.id=m.room_id WHERE m.room_id=? AND m.user_id=?',room_id,uid)
+    if not m: raise HTTPException(403,'Nie masz dostępu do tej rozmowy.')
+    return m
+
+def room_admin(room_id,uid):
+    m=room_member(room_id,uid)
+    if m['role'] not in ('owner','admin'): raise HTTPException(403,'Tylko administrator grupy może to zrobić.')
+    return m
+
+def server_member(room_id,uid):
+    m=room_member(room_id,uid)
+    if m['kind']!='server':raise HTTPException(400,'Ta funkcja dotyczy serwerów.')
+    return m
+
+def can(room_id, uid, permission):
+    m=room_member(room_id,uid)
+    if m['role'] in ('owner','admin'):return True
+    if permission=='manage_roles':return False
     if permission not in ('manage_channels','manage_messages','view_private'):return False
     row=one(f'''SELECT 1 FROM member_custom_roles mr JOIN custom_roles cr ON cr.id=mr.role_id
                   WHERE mr.room_id=? AND mr.user_id=? AND cr.{permission}=1 LIMIT 1''',room_id,uid)
@@ -223,15 +351,6 @@ def get_profile_media(uid:int,kind:str,u=Depends(current)):
 def delete_profile_media(kind:str,u=Depends(current)):
     if kind not in ('avatar','banner'):raise HTTPException(404,'Nieznany rodzaj obrazu.')
     field='avatar_rev' if kind=='avatar' else 'banner_rev'
-    with transaction() as c:c.execute(f'UPDATE users SET {field}=0 WHERE id=?',(u['id'],))
-    for old in PROFILE_MEDIA.glob(f'{u["id"]}-{kind}-*.webp'):old.unlink(missing_ok=True)
-    return {'ok':True}
-
-@app.get('/api/users')
-def users(q:str='',u=Depends(current)):
-    if len(q.strip())<2:return []
-    return [user_public(x) for x in allrows('SELECT id,username,display_name,about,color,created,status_
-        field='avatar_rev' if kind=='avatar' else 'banner_rev'
     with transaction() as c:c.execute(f'UPDATE users SET {field}=0 WHERE id=?',(u['id'],))
     for old in PROFILE_MEDIA.glob(f'{u["id"]}-{kind}-*.webp'):old.unlink(missing_ok=True)
     return {'ok':True}
@@ -373,84 +492,6 @@ async def channel_delete(rid:int,cid:int,u=Depends(current)):
 @app.get('/api/rooms/{rid}/roles')
 def roles_list(rid:int,u=Depends(current)):
     server_member(rid,u['id'])
-        if v.kind not in ('group','server'):raise HTTPException(400,'Nieprawidłowy rodzaj grupy.')
-    with transaction() as c:
-        cur=c.execute('INSERT INTO rooms(kind,name,owner_id,created) VALUES (?,?,?,?)',(v.kind,v.name.strip(),u['id'],tick()))
-        room_id=cur.lastrowid
-        c.execute('INSERT INTO members VALUES (?,?,?,?)',(room_id,u['id'],'owner',tick()))
-        if v.kind=='server':
-            c.execute('INSERT INTO room_config(room_id) VALUES (?)',(room_id,))
-            c.execute('INSERT INTO channels(room_id,name,category,kind,position,created) VALUES (?,?,?,?,?,?)',(room_id,'ogólny','TEKSTOWE','text',0,tick()))
-            c.execute('INSERT INTO channels(room_id,name,category,kind,position,created) VALUES (?,?,?,?,?,?)',(room_id,'ogłoszenia','INFORMACJE','announcement',1,tick()))
-    await push_users([u['id']]);return {'id':room_id}
-
-@app.get('/api/rooms/{rid}/studio')
-def studio(rid:int,u=Depends(current)):
-    m=room_member(rid,u['id'])
-    config=one('SELECT * FROM room_config WHERE room_id=?',rid)
-    room=one('SELECT * FROM rooms WHERE id=?',rid)
-    return {'room':dict(room), 'config':dict(config) if config else {},
-            'can_manage':m['role'] in ('owner','admin'),
-            'can_manage_channels':can(rid,u['id'],'manage_channels')}
-
-@app.patch('/api/rooms/{rid}/studio')
-async def studio_update(rid:int,data:RoomSettingsIn,u=Depends(current)):
-    m=room_admin(rid,u['id'])
-    if m['kind']=='dm':raise HTTPException(400,'Nie można zmieniać ustawień czatu prywatnego.')
-    if not COLOR_RE.fullmatch(data.accent):raise HTTPException(400,'Nieprawidłowy kolor.')
-    with transaction() as c:
-        c.execute('UPDATE rooms SET name=?,description=? WHERE id=?',(data.name.strip(),data.description.strip(),rid))
-        c.execute('INSERT OR IGNORE INTO room_config(room_id) VALUES (?)',(rid,))
-        c.execute('UPDATE room_config SET rules=?,welcome=?,accent=? WHERE room_id=?',(data.rules.strip(),data.welcome.strip(),data.accent,rid))
-    await push_room(rid);return {'ok':True}
-
-@app.get('/api/rooms/{rid}/channels')
-def channel_list(rid:int,u=Depends(current)):
-    server_member(rid,u['id'])
-    rows=allrows('SELECT * FROM channels WHERE room_id=? AND archived=0 ORDER BY category,position,id',rid)
-    return [x for x in rows if not x['staff_only'] or can(rid,u['id'],'view_private')]
-
-@app.post('/api/rooms/{rid}/channels')
-async def channel_create(rid:int,data:ChannelIn,u=Depends(current)):
-    server_member(rid,u['id'])
-    if not can(rid,u['id'],'manage_channels'):raise HTTPException(403,'Brak uprawnień do kanałów.')
-    if data.kind not in ('text','announcement','voice'):raise HTTPException(400,'Nieprawidłowy typ kanału.')
-    name=data.name.strip().lower().replace(' ','-')
-    category=data.category.strip().upper() or 'TEKSTOWE'
-    with transaction() as c:
-        if c.execute('SELECT COUNT(*) FROM channels WHERE room_id=? AND archived=0',(rid,)).fetchone()[0]>=80:
-            raise HTTPException(400,'Limit 80 kanałów na serwer.')
-        pos=c.execute('SELECT COALESCE(MAX(position),0)+1 FROM channels WHERE room_id=?',(rid,)).fetchone()[0]
-        cid=c.execute('INSERT INTO channels(room_id,name,category,kind,position,staff_only,created) VALUES (?,?,?,?,?,?,?)',(rid,name,category,data.kind,pos,int(data.staff_only),tick())).lastrowid
-    await push_room(rid);return {'id':cid}
-
-@app.patch('/api/rooms/{rid}/channels/{cid}')
-async def channel_update(rid:int,cid:int,data:ChannelIn,u=Depends(current)):
-    server_member(rid,u['id'])
-    if not can(rid,u['id'],'manage_channels'):raise HTTPException(403,'Brak uprawnień.')
-    if data.kind not in ('text','announcement','voice'):raise HTTPException(400,'Nieprawidłowy typ kanału.')
-    with transaction() as c:
-        if not c.execute('SELECT 1 FROM channels WHERE id=? AND room_id=?',(cid,rid)).fetchone():raise HTTPException(404,'Nie ma takiego kanału.')
-        c.execute('UPDATE channels SET name=?,category=?,kind=?,staff_only=? WHERE id=? AND room_id=?',(data.name.strip().lower().replace(' ','-'),data.category.strip().upper(),data.kind,int(data.staff_only),cid,rid))
-    await push_room(rid);return {'ok':True}
-
-@app.delete('/api/rooms/{rid}/channels/{cid}')
-async def channel_delete(rid:int,cid:int,u=Depends(current)):
-    server_member(rid,u['id'])
-    if not can(rid,u['id'],'manage_channels'):raise HTTPException(403,'Brak uprawnień.')
-    with transaction() as c:
-        ch=c.execute('SELECT * FROM channels WHERE id=? AND room_id=?',(cid,rid)).fetchone()
-        if not ch:raise HTTPException(404,'Brak kanału.')
-        if ch['kind']!='voice':
-            others=c.execute("SELECT COUNT(*) FROM channels WHERE room_id=? AND archived=0 AND kind IN ('text','announcement')",(rid,)).fetchone()[0]
-            if others<=1:raise HTTPException(400,'Nie możesz usunąć ostatniego kanału tekstowego.')
-        # Archive instead of reassigning private messages into public channels.
-        c.execute('UPDATE channels SET archived=1 WHERE id=? AND room_id=?',(cid,rid))
-    await push_room(rid);return {'ok':True}
-
-@app.get('/api/rooms/{rid}/roles')
-def roles_list(rid:int,u=Depends(current)):
-    server_member(rid,u['id'])
     rows=allrows('SELECT * FROM custom_roles WHERE room_id=? ORDER BY id',rid)
     mine=[r['role_id'] for r in allrows('SELECT role_id FROM member_custom_roles WHERE room_id=? AND user_id=?',rid,u['id'])]
     return {'roles':rows,'mine':mine}
@@ -501,11 +542,6 @@ def members(rid:int,u=Depends(current)):
     room_member(rid,u['id'])
     rows=allrows('SELECT u.id,u.username,u.display_name,u.color,u.about,u.avatar_rev,u.status_text,m.role FROM members m JOIN users u ON u.id=m.user_id WHERE m.room_id=? ORDER BY CASE m.role WHEN "owner" THEN 0 WHEN "admin" THEN 1 ELSE 2 END,u.username',rid)
     for row in rows:row['custom_roles']=[x['role_id'] for x in allrows('SELECT role_id FROM member_custom_roles WHERE room_id=? AND user_id=?',rid,row['id'])]
-    return rows
-
-@app.post('/api/rooms/{rid}/members/{other_id}/role')
-async def set_role(rid:int,other_id:int,data:RoleIn,u=Depends(current)):
-    m=room_member(rid,u['id'])
     return rows
 
 @app.post('/api/rooms/{rid}/members/{other_id}/role')
@@ -619,7 +655,22 @@ async def react(mid:int,data:ReactionIn,u=Depends(current)):
             c.execute('DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?',(mid,u['id'],data.emoji))
         else:c.execute('INSERT INTO reactions VALUES (?,?,?)',(mid,u['id'],data.emoji))
     await push_room(m['room_id']);return {'ok':True}
-        if not p:raise HTTPException(404,'Brak ankiety.')
+
+@app.post('/api/rooms/{rid}/polls')
+async def create_poll(rid:int,data:PollIn,u=Depends(current)):
+    channel_check(rid,data.channel_id,u['id'],sending=True)
+    options=[v.strip() for v in data.options if v.strip()]
+    if not 2<=len(options)<=8 or any(len(x)>80 for x in options):raise HTTPException(400,'Ankieta musi mieć od 2 do 8 odpowiedzi (maks. 80 znaków).')
+    with transaction() as c:
+        p=c.execute('INSERT INTO polls(room_id,question,creator,multiple,anonymous,created) VALUES (?,?,?,?,?,?)',(rid,data.question.strip(),u['id'],int(data.multiple),int(data.anonymous),tick())).lastrowid
+        for opt in options:c.execute('INSERT INTO poll_options(poll_id,label) VALUES (?,?)',(p,opt))
+        c.execute("INSERT INTO messages(room_id,user_id,body,kind,ref_id,created,channel_id) VALUES (?,?,?,'poll',?,?,?)",(rid,u['id'],data.question.strip(),p,tick(),data.channel_id))
+    await push_room(rid);return {'id':p}
+
+@app.post('/api/polls/{pid}/vote')
+async def vote(pid:int,data:VoteIn,u=Depends(current)):
+    p=one('SELECT * FROM polls WHERE id=?',pid)
+    if not p:raise HTTPException(404,'Brak ankiety.')
     pm=one("SELECT channel_id FROM messages WHERE kind='poll' AND ref_id=?",pid)
     channel_check(p['room_id'],pm['channel_id'] if pm else None,u['id'])
     requested=list(dict.fromkeys(data.option_ids))
@@ -692,57 +743,6 @@ async def ws(websocket:WebSocket):
     u=session_user(websocket.cookies.get('vilo_session'))
     if not u:await websocket.close(code=1008);return
     await websocket.accept()
-    connected.setdefault(u['id'],set()).add(websocket)
-    await push_users([u['id']])
-    try:
-        while True:
-            msg=await websocket.receive_text()
-            if msg=='ping':
-                await websocket.send_json({'type':'pong'})
-                continue
-            # Only relay WebRTC signals between members of the same 1:1 DM.
-            # This does not establish an Internet calling service by itself.
-            if len(msg)>45000: continue
-            try: signal=json.loads(msg)
-            except (json.JSONDecodeError,TypeError): continue
-            if not isinstance(signal,dict) or signal.get('type')!='call': continue
-            phase=signal.get('phase')
-            if phase not in ('invite','accept','reject','offer','answer','ice','hangup'): continue
-            try:rid=int(signal.get('room_id'));target=int(signal.get('to'))
-            except (TypeError,ValueError):continue
-            if rid<1 or target==u['id']: continue
-            valid=one("""SELECT 1 FROM rooms r
-                JOIN members a ON a.room_id=r.id AND a.user_id=?
-                JOIN members b ON b.room_id=r.id AND b.user_id=?
-                WHERE r.id=? AND r.kind='dm'""",u['id'],target,rid)
-            if not valid: continue
-            payload=signal.get('payload')
-            if phase in ('offer','answer','ice'):
-                if not isinstance(payload,dict) or len(json.dumps(payload))>35000:continue
-            else:payload=None
-            for target_ws in list(connected.get(target,set())):
-                try:await target_ws.send_json({'type':'call','phase':phase,'from':u['id'],'room_id':rid,'payload':payload})
-                except Exception:connected.get(target,set()).discard(target_ws)
-    except (WebSocketDisconnect,RuntimeError): pass
-    finally:
-        connected.get(u['id'],set()).discard(websocket)
-        await push_users([u['id']])
-
-@app.get('/api/online')
-def online(u=Depends(current)):
-    return {'ids':[uid for uid,ws in connected.items() if ws]}
-
-@app.get('/api/health')
-def health():return {'status':'ok','app':'VILO'}
-
-@app.get('/sw.js')
-def service_worker():
-    return FileResponse(ROOT/'static'/'sw.js',media_type='application/javascript',headers={'Cache-Control':'no-cache','Service-Worker-Allowed':'/'})
-
-@app.get('/')
-def index():return FileResponse(ROOT/'static'/'index.html')
-app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
-   await websocket.accept()
     connected.setdefault(u['id'],set()).add(websocket)
     await push_users([u['id']])
     try:
