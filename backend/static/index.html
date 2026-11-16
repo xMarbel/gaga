@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/><meta name="theme-color" content="#111421"/><meta name="description" content="VILO — twoje miejsce do rozmów i społeczności."/><meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="VILO"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="application-name" content="VILO"/>
+<link rel="manifest" href="/static/manifest.webmanifest"/>
+<link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png"/>
+<title>VILO — Twoje rozmowy</title><link rel="icon" href="/static/favicon.png"><link rel="stylesheet" href="/static/style.css"></head><body>
+<div id="app"><div class="splash"><img src="/static/vilo-icon.png" alt="VILO"><h1>VILO</h1><p>Ładowanie…</p></div></div>
+<div id="modal-root"></div><div id="toasts" aria-live="polite"></div>
+<script defer src="/static/app.js"></script><script>
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+</script></body></html>
